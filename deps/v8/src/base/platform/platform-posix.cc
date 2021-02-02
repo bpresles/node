@@ -111,6 +111,7 @@ const int kMmapFdOffset = 0;
 int GetProtectionFromMemoryPermission(OS::MemoryPermission access) {
   switch (access) {
     case OS::MemoryPermission::kNoAccess:
+    case OS::MemoryPermission::kNoAccessWillJitLater:
       return PROT_NONE;
     case OS::MemoryPermission::kRead:
       return PROT_READ;
@@ -134,6 +135,11 @@ int GetFlagsForMemoryPermission(OS::MemoryPermission access) {
     flags |= MAP_LAZY;
 #endif  // V8_OS_QNX
   }
+  #if V8_OS_MACOSX && V8_HOST_ARCH_ARM64 && defined(MAP_JIT)
+    if (access == OS::MemoryPermission::kNoAccessWillJitLater) {
+      flags |= MAP_JIT;
+    }
+  #endif
   return flags;
 }
 

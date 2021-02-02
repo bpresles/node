@@ -6,6 +6,7 @@
 
 #include <iomanip>
 
+#include "src/base/build_config.h"
 #include "src/base/adapters.h"
 #include "src/base/macros.h"
 #include "src/base/platform/platform.h"
@@ -21,6 +22,7 @@
 #include "src/snapshot/embedded/embedded-data.h"
 #include "src/utils/ostreams.h"
 #include "src/utils/vector.h"
+#include "src/wasm/code-space-access.h"
 #include "src/wasm/compilation-environment.h"
 #include "src/wasm/function-compiler.h"
 #include "src/wasm/jump-table-assembler.h"
@@ -44,6 +46,10 @@ namespace internal {
 namespace wasm {
 
 using trap_handler::ProtectedInstructionData;
+
+#if defined(V8_OS_MACOSX) && defined(V8_HOST_ARCH_ARM64)
+thread_local int CodeSpaceWriteScope::code_space_write_nesting_level_ = 0;
+#endif
 
 base::AddressRegion DisjointAllocationPool::Merge(base::AddressRegion region) {
   auto dest_it = regions_.begin();
@@ -626,6 +632,7 @@ void WasmCodeAllocator::FreeCode(Vector<WasmCode* const> codes) {
   // Zap code area and collect freed code regions.
   DisjointAllocationPool freed_regions;
   size_t code_size = 0;
+  CODE_SPACE_WRITE_SCOPE
   for (WasmCode* code : codes) {
     ZapCode(code->instruction_start(), code->instructions().size());
     FlushInstructionCache(code->instruction_start(),
@@ -731,6 +738,7 @@ CompilationEnv NativeModule::CreateCompilationEnv() const {
 }
 
 WasmCode* NativeModule::AddCodeForTesting(Handle<Code> code) {
+  CODE_SPACE_WRITE_SCOPE
   return AddAndPublishAnonymousCode(code, WasmCode::kFunction);
 }
 
@@ -742,6 +750,7 @@ void NativeModule::UseLazyStub(uint32_t func_index) {
   if (!lazy_compile_table_) {
     uint32_t num_slots = module_->num_declared_functions;
     WasmCodeRefScope code_ref_scope;
+    CODE_SPACE_WRITE_SCOPE
     DCHECK_EQ(1, code_space_data_.size());
     lazy_compile_table_ = CreateEmptyJumpTableInRegion(
         JumpTableAssembler::SizeForNumberOfLazyFunctions(num_slots),
@@ -941,6 +950,7 @@ std::unique_ptr<WasmCode> NativeModule::AddCodeWithCodeSpace(
       static_cast<size_t>(desc.code_comments_offset);
   const size_t instr_size = static_cast<size_t>(desc.instr_size);
 
+  CODE_SPACE_WRITE_SCOPE
   memcpy(dst_code_bytes.begin(), desc.buffer,
          static_cast<size_t>(desc.instr_size));
 
@@ -1070,6 +1080,7 @@ WasmCode* NativeModule::AddDeserializedCode(
     OwnedVector<const byte> reloc_info,
     OwnedVector<const byte> source_position_table, WasmCode::Kind kind,
     ExecutionTier tier) {
+  // CodeSpaceWriteScope is provided by the caller.
   Vector<uint8_t> dst_code_bytes =
       code_allocator_.AllocateForCode(this, instructions.size());
   memcpy(dst_code_bytes.begin(), instructions.begin(), instructions.size());
@@ -1126,6 +1137,7 @@ WasmCode* NativeModule::CreateEmptyJumpTableInRegion(
   Vector<uint8_t> code_space =
       code_allocator_.AllocateForCodeInRegion(this, jump_table_size, region);
   DCHECK(!code_space.empty());
+  CODE_SPACE_WRITE_SCOPE
   ZapCode(reinterpret_cast<Address>(code_space.begin()), code_space.size());
   std::unique_ptr<WasmCode> code{new WasmCode{
       this,                                     // native_module
@@ -1171,6 +1183,7 @@ void NativeModule::AddCodeSpace(base::AddressRegion region) {
 #endif  // V8_OS_WIN64
 
   WasmCodeRefScope code_ref_scope;
+  CODE_SPACE_WRITE_SCOPE
   WasmCode* jump_table = nullptr;
   const uint32_t num_wasm_functions = module_->num_declared_functions;
   const bool has_functions = num_wasm_functions > 0;
@@ -1353,7 +1366,11 @@ VirtualMemory WasmCodeManager::TryAllocate(size_t size, void* hint) {
   if (!memory_tracker_->ReserveAddressSpace(size)) return {};
   if (hint == nullptr) hint = page_allocator->GetRandomMmapAddr();
 
-  VirtualMemory mem(page_allocator, size, hint, allocate_page_size);
+  // When we start exposing Wasm in jitless mode, then the jitless flag
+  // will have to determine whether we set kMapAsJittable or not.
+  DCHECK(!FLAG_jitless);
+  VirtualMemory mem(page_allocator, size, hint, allocate_page_size,
+                    VirtualMemory::kMapAsJittable);
   if (!mem.IsReserved()) {
     memory_tracker_->ReleaseReservation(size);
     return {};
@@ -1513,6 +1530,7 @@ std::vector<WasmCode*> NativeModule::AddCompiledCode(
   DCHECK(!results.empty());
   // First, allocate code space for all the results.
   size_t total_code_space = 0;
+  CODE_SPACE_WRITE_SCOPE
   for (auto& result : results) {
     DCHECK(result.succeeded());
     total_code_space += RoundUp<kCodeAlignment>(result.code_desc.instr_size);
